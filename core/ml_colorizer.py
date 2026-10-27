@@ -60,6 +60,16 @@ def build_hint_arrays(h: int, w: int, size: int,
     return hint, mask
 
 
+def _call_progress(cb, frac: float) -> None:
+    """Safely invoke a progress callback with a clamped 0..1 fraction."""
+    if cb is None:
+        return
+    try:
+        cb(min(1.0, max(0.0, float(frac))))
+    except Exception:
+        pass
+
+
 class MangaColorizer:
     """Wrapper around manga-colorization-v2 with tiled / per-panel paths."""
 
@@ -175,7 +185,8 @@ class MangaColorizer:
                  panel_style: str = "western",
                  deherron: bool = False,
                  deherron_strength: float = 0.6,
-                 hint_points=None) -> np.ndarray:
+                 hint_points=None,
+                 progress_cb=None) -> np.ndarray:
         """Colorize a single B&W page image.
 
         Parameters
@@ -228,6 +239,7 @@ class MangaColorizer:
                 image, size=size, denoise_sigma=denoise_sigma,
                 tiled=tiled, tile_size=tile_size, tile_overlap=tile_overlap,
                 panel_style=panel_style, hint_points=hint_points,
+                progress_cb=progress_cb,
             )
 
         if tiled:
@@ -235,21 +247,26 @@ class MangaColorizer:
             return self._colorize_tiled(
                 image, denoise_sigma=denoise_sigma,
                 tile_size=tile_size, overlap=tile_overlap,
+                progress_cb=progress_cb,
             )
 
         return self._colorize_simple(image, size=size, denoise_sigma=denoise_sigma,
-                                     hint_points=hint_points)
+                                     hint_points=hint_points,
+                                     progress_cb=progress_cb)
 
     # ── Simple resize-and-go path (legacy) ─────────────────────────────────
 
     def _colorize_simple(self, image: np.ndarray, size: int,
-                         denoise_sigma: int, hint_points=None) -> np.ndarray:
+                         denoise_sigma: int, hint_points=None,
+                         progress_cb=None) -> np.ndarray:
         rgb = cv2.cvtColor(image, cv2.COLOR_BGR2RGB)
         orig_h, orig_w = rgb.shape[:2]
 
+        _call_progress(progress_cb, 0.0)
         with self._lock:
             result = self._safe_colorize(rgb, size, denoise_sigma,
                                          hint_points=hint_points)
+        _call_progress(progress_cb, 1.0)
 
         result_uint8 = np.clip(result * 255.0, 0, 255).astype(np.uint8)
         result_bgr = cv2.cvtColor(result_uint8, cv2.COLOR_RGB2BGR)
@@ -280,7 +297,8 @@ class MangaColorizer:
     def _colorize_per_panel(self, image: np.ndarray, *,
                             size: int, denoise_sigma: int,
                             tiled: bool, tile_size: int, tile_overlap: int,
-                            panel_style: str, hint_points=None) -> np.ndarray:
+                            panel_style: str, hint_points=None,
+                            progress_cb=None) -> np.ndarray:
         """Detect panels, colorize each, composite back into the page."""
         from models.schemas import PanelRegion
 
@@ -293,13 +311,16 @@ class MangaColorizer:
         if not panels or len(panels) <= 1:
             if tiled:
                 return self._colorize_tiled(image, denoise_sigma=denoise_sigma,
-                                            tile_size=tile_size, overlap=tile_overlap)
+                                            tile_size=tile_size, overlap=tile_overlap,
+                                            progress_cb=progress_cb)
             return self._colorize_simple(image, size=size, denoise_sigma=denoise_sigma,
-                                         hint_points=hint_points)
+                                         hint_points=hint_points,
+                                         progress_cb=progress_cb)
 
         page_h, page_w = image.shape[:2]
         out = image.copy()
-        for panel in panels:
+        total_panels = len(panels)
+        for k, panel in enumerate(panels):
             crop = extract_panel_image(image, panel)
             if crop.size == 0:
                 continue
@@ -309,15 +330,20 @@ class MangaColorizer:
 
             panel_hints = self._hints_for_panel(hint_points, panel, page_w, page_h)
 
+            def _panel_cb(f, _k=k):
+                _call_progress(progress_cb, (_k + f) / total_panels)
+
             if tiled and max(ph, pw) > tile_size:
                 colored = self._colorize_tiled(
                     crop, denoise_sigma=denoise_sigma,
                     tile_size=tile_size, overlap=tile_overlap,
+                    progress_cb=_panel_cb,
                 )
             else:
                 colored = self._colorize_simple(
                     crop, size=size, denoise_sigma=denoise_sigma,
                     hint_points=panel_hints,
+                    progress_cb=_panel_cb,
                 )
 
             # Composite back, with a small feather at the seam
@@ -349,7 +375,8 @@ class MangaColorizer:
     def _colorize_tiled(self, image: np.ndarray, *,
                         denoise_sigma: int,
                         tile_size: int = 768,
-                        overlap: int = 96) -> np.ndarray:
+                        overlap: int = 96,
+                        progress_cb=None) -> np.ndarray:
         """Colorize at native resolution by tiling.
 
         Each tile is fed to mc-v2 at exactly *tile_size* (the model's
@@ -365,7 +392,8 @@ class MangaColorizer:
 
         # If the page already fits in one tile, just run the simple path
         if h <= tile_size and w <= tile_size:
-            return self._colorize_simple(image, size=tile_size, denoise_sigma=denoise_sigma)
+            return self._colorize_simple(image, size=tile_size, denoise_sigma=denoise_sigma,
+                                         progress_cb=progress_cb)
 
         # Stride: how far we move each step
         stride = tile_size - overlap
@@ -387,6 +415,8 @@ class MangaColorizer:
         # Per-tile feather alpha
         feather = self._tile_feather(tile_size, tile_size, overlap)
 
+        total_tiles = len(ys) * len(xs)
+        tile_idx = 0
         for y in ys:
             for x in xs:
                 tile_bgr = image[y:y + tile_size, x:x + tile_size]
@@ -411,6 +441,9 @@ class MangaColorizer:
 
                 accum[y:y + use_h, x:x + use_w] += out_bgr.astype(np.float32) * tile_alpha
                 weight[y:y + use_h, x:x + use_w] += tile_alpha
+
+                tile_idx += 1
+                _call_progress(progress_cb, tile_idx / total_tiles)
 
         weight = np.maximum(weight, 1e-6)
         return np.clip(accum / weight, 0, 255).astype(np.uint8)

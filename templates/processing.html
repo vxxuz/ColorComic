@@ -24,6 +24,20 @@
                 <span id="colorPct">0%</span>
             </div>
 
+            <div class="page-progress mt-2" id="pageProgressWrap" hidden>
+                <div class="progress-bar page-bar" id="pageBar" role="progressbar"
+                     aria-label="Current page progress"
+                     aria-valuemin="0" aria-valuemax="100" aria-valuenow="0">
+                    <div class="fill page-fill" id="pageFill"></div>
+                </div>
+                <div class="progress-info">
+                    <span id="pageCounter">Page 1 of {{ job.page_count }}</span>
+                    <span id="pagePct">0%</span>
+                </div>
+            </div>
+
+            <p class="hint mt-1" id="etaText" aria-live="polite"></p>
+
             <button class="btn btn-secondary mt-2" id="cancelBtn">Cancel job</button>
 
             <div id="previewArea" class="mt-2" hidden>
@@ -81,6 +95,12 @@
     const colorFill = document.getElementById('colorFill');
     const colorCounter = document.getElementById('colorCounter');
     const colorPct = document.getElementById('colorPct');
+    const pageBar = document.getElementById('pageBar');
+    const pageFill = document.getElementById('pageFill');
+    const pageCounter = document.getElementById('pageCounter');
+    const pagePct = document.getElementById('pagePct');
+    const pageProgressWrap = document.getElementById('pageProgressWrap');
+    const etaText = document.getElementById('etaText');
     const cancelBtn = document.getElementById('cancelBtn');
     const previewArea = document.getElementById('previewArea');
 
@@ -119,6 +139,40 @@
         colorCounter.textContent = `${processed} / ${total}`;
         colorPct.textContent = pct + '%';
         colorBar.setAttribute('aria-valuenow', String(pct));
+    }
+
+    // Per-page granularity: fraction of the *current* page done (0..1).
+    function setPageProgress(frac, pageIndex) {
+        if (typeof frac !== 'number' || frac < 0) return;
+        const pct = Math.min(100, Math.round(frac * 100));
+        pageFill.style.width = pct + '%';
+        pagePct.textContent = pct + '%';
+        pageBar.setAttribute('aria-valuenow', String(pct));
+        if (typeof pageIndex === 'number' && pageCount) {
+            pageCounter.textContent = `Page ${pageIndex + 1} of ${pageCount}`;
+        }
+        pageProgressWrap.hidden = false;
+    }
+
+    function formatEta(seconds) {
+        if (typeof seconds !== 'number' || seconds < 0) return '';
+        const s = Math.round(seconds);
+        if (s <= 0) return 'almost done';
+        if (s < 60) return `${s}s`;
+        if (s < 3600) {
+            const m = Math.floor(s / 60), sec = s % 60;
+            return `${m}m ${sec}s`;
+        }
+        const h = Math.floor(s / 3600), m = Math.floor((s % 3600) / 60);
+        return `${h}h ${m}m`;
+    }
+
+    function updateEta(seconds) {
+        if (typeof seconds !== 'number' || seconds < 0) {
+            etaText.textContent = '';
+            return;
+        }
+        etaText.textContent = `Estimated time remaining: ${formatEta(seconds)}`;
     }
 
     function finish(kind, message) {
@@ -170,15 +224,21 @@
             case 'colorizing':
                 if (typeof data.total === 'number') pageCount = data.total;
                 setProgress(data.processed_count || 0, data.total || pageCount);
+                setPageProgress(data.page_progress || 0, data.page);
+                updateEta(data.eta_seconds);
                 setStep(`Colorizing page ${data.page + 1}…`);
                 break;
             case 'done_page':
                 if (typeof data.total === 'number') pageCount = data.total;
                 setProgress(data.processed_count, data.total || pageCount);
+                setPageProgress(1, data.page);
+                updateEta(data.eta_seconds);
                 updateThumbs(data.page);
                 break;
             case 'assembling':
                 setStep('Assembling PDF…');
+                pageProgressWrap.hidden = true;
+                etaText.textContent = '';
                 break;
         }
     }
@@ -212,6 +272,10 @@
             setIndeterminate(true);
         } else {
             setProgress(job.processed_count || 0, job.page_count || pageCount);
+            if (job.page_count && job.processed_count > 0) {
+                setPageProgress(job.page_progress || 0, job.processed_count - 1);
+            }
+            updateEta(job.eta_seconds);
             if (job.current_step) setStep(job.current_step);
         }
         return false;

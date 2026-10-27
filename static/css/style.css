@@ -288,6 +288,27 @@ input:focus, select:focus, textarea:focus {
     margin-top: 0.5rem;
 }
 
+/* Per-page sub-progress (thinner bar, secondary accent tone) */
+.page-progress .page-bar {
+    height: 5px;
+    background: var(--surface2);
+}
+
+.page-progress .page-bar .fill.page-fill {
+    background: var(--accent-hover);
+    transition: width 0.2s ease;
+}
+
+.page-progress .progress-info {
+    font-size: 0.8rem;
+    margin-top: 0.35rem;
+}
+
+#etaText {
+    color: var(--accent);
+    font-weight: 500;
+}
+
 /* ── Image Viewer ─────────────────────────────────────────────────── */
 
 .image-viewer {

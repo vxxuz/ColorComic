@@ -269,7 +269,8 @@ class MangaNinjaColorizer:
                  *,
                  reference_images: list[np.ndarray] | None = None,
                  num_inference_steps: int | None = None,
-                 refine_pass: bool = False) -> np.ndarray:
+                 refine_pass: bool = False,
+                 progress_cb=None) -> np.ndarray:
         """Colorize a single B&W page using one or more colored references.
 
         Parameters
@@ -314,6 +315,7 @@ class MangaNinjaColorizer:
                     width=size,
                     height=size,
                     ref_cache=self._get_pipe_ref_cache(ref_key, size),
+                    callback=(lambda f: progress_cb(f * 0.85)) if progress_cb else None,
                 )
 
                 if refine_pass:
@@ -331,6 +333,7 @@ class MangaNinjaColorizer:
                             width=refine_size,
                             height=refine_size,
                             ref_cache=self._get_pipe_ref_cache(ref_key, refine_size),
+                            callback=(lambda f: progress_cb(0.85 + f * 0.15)) if progress_cb else None,
                         )
                     except Exception as exc:
                         print(f"[MangaNinja] refine pass skipped: {exc}")

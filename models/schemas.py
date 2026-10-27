@@ -39,6 +39,14 @@ class JobState(BaseModel):
     status: str = "uploaded"  # extracting | ready | colorizing | done | error | cancelled
     progress: float = 0.0
     processed_count: int = 0
+    # Per-page granularity: fraction of the *current* page completed (0..1),
+    # when the current page was started, and a smoothed seconds-per-page EMA.
+    page_progress: float = 0.0
+    page_started_at: Optional[float] = None
+    avg_seconds_per_page: Optional[float] = None
+    seconds_per_page_estimate: float = 5.0
+    # Remaining-seconds estimate computed from the above (surfaced to UI).
+    eta_seconds: Optional[float] = None
     current_step: str = ""
     error: Optional[str] = None
     cancel_requested: bool = False

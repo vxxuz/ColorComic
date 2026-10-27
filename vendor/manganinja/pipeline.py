@@ -94,6 +94,7 @@ class MangaNinjiaPipeline(DiffusionPipeline):
         height: int = 512,
         generator: Optional[torch.Generator] = None,
         ref_cache: Optional[dict] = None,
+        callback: Optional[callable] = None,
     ) -> np.ndarray:
         """Run colorization.
 
@@ -277,6 +278,9 @@ class MangaNinjiaPipeline(DiffusionPipeline):
 
             # DDIM step
             latents = self.scheduler.step(noise_pred_combined, t, latents).prev_sample
+
+            if callback is not None:
+                callback((i + 1) / len(timesteps))
 
         # 13. Decode
         latents = latents / self.vae.config.scaling_factor

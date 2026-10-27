@@ -490,7 +490,8 @@ def _colorize_one(job: JobState, colorizer, page_index: int,
                   ref_images: list[np.ndarray] | None,
                   style_key: str | None = None,
                   quality_key: str | None = None,
-                  guided: GuidedColorist | None = None) -> str:
+                  guided: GuidedColorist | None = None,
+                  progress_cb=None) -> str:
     """Colorize one page and return the output path.
 
     ``style_key`` / ``quality_key`` override the job presets for this call
@@ -517,6 +518,7 @@ def _colorize_one(job: JobState, colorizer, page_index: int,
             reference_images=ref_images,
             num_inference_steps=int(s.diffusion_steps * q.diffusion_step_mult),
             refine_pass=q.refine_pass,
+            progress_cb=progress_cb,
         )
     elif job.mode == "llm":
         result = colorizer.colorize(
@@ -538,6 +540,7 @@ def _colorize_one(job: JobState, colorizer, page_index: int,
             deherron=Config.DEHERRON_SCREENTONES,
             deherron_strength=Config.DEHERRON_STRENGTH,
             hint_points=hint_points,
+            progress_cb=progress_cb,
         )
 
     # Post-processing
@@ -601,6 +604,39 @@ def _set_page_output(job: JobState, page_index: int, out_path: str) -> None:
     job.colorized_images[page_index] = out_path
 
 
+def _format_eta(seconds: float | None) -> str | None:
+    """Render a remaining-time estimate as a short human string."""
+    if seconds is None or seconds < 0:
+        return None
+    s = int(round(seconds))
+    if s <= 0:
+        return "almost done"
+    if s < 60:
+        return f"{s}s"
+    if s < 3600:
+        m, sec = divmod(s, 60)
+        return f"{m}m {sec}s"
+    h, rem = divmod(s, 3600)
+    m = rem // 60
+    return f"{h}h {m}m"
+
+
+def _eta_seconds(job: JobState) -> float | None:
+    """Estimate seconds until all remaining pages are done.
+
+    Uses the smoothed per-page average once we have observations, falling
+    back to the quality preset's static estimate for the first page.
+    """
+    if job.processed_count >= job.page_count:
+        return 0.0
+    remaining = job.page_count - job.processed_count
+    if job.avg_seconds_per_page:
+        per = job.avg_seconds_per_page
+    else:
+        per = job.seconds_per_page_estimate
+    return remaining * per
+
+
 # ── API: Colorize (ML pipeline) ─────────────────────────────────────────────
 
 
@@ -631,7 +667,9 @@ def _colorize_pages_llm(job: JobState, colorizer, order: list[int],
             return i, _colorize_one(job, colorizer, i, pp, consistency, None, None)
 
     q.put({"status": "colorizing", "page": order[0],
-           "processed_count": 0, "total": job.page_count})
+           "processed_count": 0, "total": job.page_count,
+           "page_progress": 0.0})
+    batch_started_at = time.time()
     with ThreadPoolExecutor(max_workers=max_workers) as pool:
         futures = {pool.submit(_one, i): i for i in order}
         for fut in as_completed(futures):
@@ -640,8 +678,19 @@ def _colorize_pages_llm(job: JobState, colorizer, order: list[int],
                 raise _JobCancelled()
             i, out_path = fut.result()  # raises on page failure
             _set_page_output(job, i, out_path)
+            # LLM pages run concurrently — use wall-clock since batch start
+            # divided by completed count as a (rough but monotonic) per-page
+            # rate for ETA purposes.
+            completed = job.processed_count + 1
+            dur = (time.time() - batch_started_at) / completed
+            prev_avg = job.avg_seconds_per_page
+            job.avg_seconds_per_page = (
+                dur if prev_avg is None else 0.7 * prev_avg + 0.3 * dur
+            )
             job.processed_count += 1
             job.progress = job.processed_count / job.page_count
+            job.page_progress = 1.0
+            job.eta_seconds = _eta_seconds(job)
             quality_record = (
                 job.page_quality[i].model_dump()
                 if i < len(job.page_quality) else None
@@ -651,6 +700,9 @@ def _colorize_pages_llm(job: JobState, colorizer, order: list[int],
                 "total": job.page_count,
                 "processed_count": job.processed_count,
                 "status": "done_page",
+                "page_progress": 1.0,
+                "avg_seconds_per_page": job.avg_seconds_per_page,
+                "eta_seconds": job.eta_seconds,
                 "quality": quality_record,
             })
 
@@ -673,10 +725,19 @@ def start_colorize(job_id):
         job.status = "colorizing"
     job.progress = 0.0
     job.processed_count = 0
+    job.page_progress = 0.0
+    job.page_started_at = None
+    job.avg_seconds_per_page = None
+    job.eta_seconds = None
     job.colorized_images = []
     job.page_quality = []
     job.cancel_requested = False
     job.error = None
+    try:
+        job.seconds_per_page_estimate = get_quality(job.quality).seconds_per_page_estimate
+    except Exception:
+        job.seconds_per_page_estimate = 5.0
+    job.eta_seconds = _eta_seconds(job)
     q = queue.Queue()
     job_queues[job_id] = q
 
@@ -741,18 +802,50 @@ def start_colorize(job_id):
                         for i in order:
                             if job.cancel_requested:
                                 raise _JobCancelled()
+
+                            job.page_started_at = time.time()
+                            job.page_progress = 0.0
+                            job.eta_seconds = _eta_seconds(job)
                             q.put({"page": i, "total": job.page_count,
                                    "processed_count": job.processed_count,
-                                   "status": "colorizing"})
+                                   "status": "colorizing",
+                                   "page_progress": 0.0,
+                                   "eta_seconds": job.eta_seconds})
+
+                            last_emit = [None]
+
+                            def _page_cb(frac):
+                                job.page_progress = frac
+                                # Emit a lightweight event at ~1% page-granularity
+                                # so the bar animates smoothly during long pages.
+                                bucket = int(frac * 100)
+                                if last_emit[0] is None or bucket >= last_emit[0] + 2:
+                                    last_emit[0] = bucket
+                                    job.eta_seconds = _eta_seconds(job)
+                                    q.put({
+                                        "page": i, "total": job.page_count,
+                                        "processed_count": job.processed_count,
+                                        "status": "colorizing",
+                                        "page_progress": frac,
+                                        "eta_seconds": job.eta_seconds,
+                                    })
 
                             out_path = _colorize_one(
                                 job, colorizer, i, pp, consistency, characters,
-                                ref_images, guided=guided,
+                                ref_images, guided=guided, progress_cb=_page_cb,
                             )
                             _set_page_output(job, i, out_path)
 
+                            # Update the smoothed per-page duration EMA.
+                            dur = time.time() - (job.page_started_at or time.time())
+                            prev_avg = job.avg_seconds_per_page
+                            job.avg_seconds_per_page = (
+                                dur if prev_avg is None else 0.7 * prev_avg + 0.3 * dur
+                            )
+                            job.page_progress = 1.0
                             job.processed_count += 1
                             job.progress = job.processed_count / job.page_count
+                            job.eta_seconds = _eta_seconds(job)
                             quality_record = (
                                 job.page_quality[i].model_dump()
                                 if i < len(job.page_quality) else None
@@ -762,6 +855,9 @@ def start_colorize(job_id):
                                 "total": job.page_count,
                                 "processed_count": job.processed_count,
                                 "status": "done_page",
+                                "page_progress": 1.0,
+                                "avg_seconds_per_page": job.avg_seconds_per_page,
+                                "eta_seconds": job.eta_seconds,
                                 "quality": quality_record,
                             })
 
@@ -1043,6 +1139,10 @@ def job_info(job_id):
         "progress": job.progress,
         "processed_count": job.processed_count,
         "page_count": job.page_count,
+        "page_progress": job.page_progress,
+        "avg_seconds_per_page": job.avg_seconds_per_page,
+        "seconds_per_page_estimate": job.seconds_per_page_estimate,
+        "eta_seconds": job.eta_seconds,
         "anchor_page_index": job.anchor_page_index,
         "style": job.style,
         "quality": job.quality,
