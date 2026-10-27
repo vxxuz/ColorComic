@@ -9,7 +9,6 @@ import os
 import numpy as np
 import torch
 import torch.nn as nn
-from huggingface_hub import hf_hub_download
 
 
 class ResidualBlock(nn.Module):
@@ -95,7 +94,8 @@ class BatchLineartDetector:
         if not os.path.exists(model_path):
             os.makedirs(ckpt_dir, exist_ok=True)
             print("Downloading lineart annotator weights...")
-            model_path = hf_hub_download(
+            from core.hf_offline import hub_download
+            model_path = hub_download(
                 repo_id="lllyasviel/Annotators",
                 filename="sk_model.pth",
                 local_dir=ckpt_dir,

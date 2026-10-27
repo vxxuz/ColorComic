@@ -42,8 +42,10 @@ def _try_load_clip():
         from transformers import CLIPVisionModelWithProjection, CLIPImageProcessor
         name = os.environ.get("CHARACTER_CLIP_PATH", "openai/clip-vit-base-patch32")
         device = "cuda" if torch.cuda.is_available() else "cpu"
-        model = CLIPVisionModelWithProjection.from_pretrained(name).to(device).eval()
-        processor = CLIPImageProcessor.from_pretrained(name)
+        from core.hf_offline import from_pretrained
+        model = from_pretrained(
+            CLIPVisionModelWithProjection, name).to(device).eval()
+        processor = from_pretrained(CLIPImageProcessor, name)
         _CLIP_MODEL = model
         _CLIP_PROCESSOR = processor
         _CLIP_DEVICE = device

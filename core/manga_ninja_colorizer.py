@@ -71,7 +71,8 @@ class MangaNinjaColorizer:
         state = torch.load(ckpt_path, map_location="cpu")
 
         kwargs = {"subfolder": subfolder} if subfolder else {}
-        config = model_cls.load_config(pretrained_path, **kwargs)
+        from core.hf_offline import from_pretrained, load_config
+        config = load_config(model_cls, pretrained_path, **kwargs)
         config = dict(config)
         config.update(config_overrides)
         model = model_cls.from_config(config)
@@ -81,8 +82,8 @@ class MangaNinjaColorizer:
             # Partial checkpoint — base weights are needed for the gaps.
             print(f"[MangaNinja] {label}: checkpoint misses {len(missing)} keys; "
                   "loading base weights first")
-            model = model_cls.from_pretrained(
-                pretrained_path, low_cpu_mem_usage=False,
+            model = from_pretrained(
+                model_cls, pretrained_path, low_cpu_mem_usage=False,
                 ignore_mismatched_sizes=True, **kwargs, **config_overrides,
             )
             model.load_state_dict(state, strict=False)
@@ -120,12 +121,13 @@ class MangaNinjaColorizer:
         print("[MangaNinja] Loading SD 1.5 components...")
 
         # DPM-Solver++ reaches DDIM@30 quality in ~14-16 steps (~2x faster)
-        scheduler = DPMSolverMultistepScheduler.from_pretrained(
-            cfg.SD15_MODEL_PATH, subfolder="scheduler",
+        from core.hf_offline import from_pretrained
+        scheduler = from_pretrained(
+            DPMSolverMultistepScheduler, cfg.SD15_MODEL_PATH, subfolder="scheduler",
             algorithm_type="dpmsolver++", use_karras_sigmas=True,
         )
-        vae = AutoencoderKL.from_pretrained(
-            cfg.SD15_MODEL_PATH, subfolder="vae", torch_dtype=dtype,
+        vae = from_pretrained(
+            AutoencoderKL, cfg.SD15_MODEL_PATH, subfolder="vae", torch_dtype=dtype,
         )
 
         denoising_unet = self._build_from_checkpoint(
@@ -142,10 +144,11 @@ class MangaNinjaColorizer:
         )
 
         print("[MangaNinja] Loading CLIP...")
-        tokenizer = CLIPTokenizer.from_pretrained(cfg.CLIP_VISION_PATH)
-        text_encoder = CLIPTextModel.from_pretrained(cfg.CLIP_VISION_PATH, torch_dtype=dtype)
-        image_encoder = CLIPVisionModelWithProjection.from_pretrained(
-            cfg.CLIP_VISION_PATH, torch_dtype=dtype,
+        tokenizer = from_pretrained(CLIPTokenizer, cfg.CLIP_VISION_PATH)
+        text_encoder = from_pretrained(
+            CLIPTextModel, cfg.CLIP_VISION_PATH, torch_dtype=dtype)
+        image_encoder = from_pretrained(
+            CLIPVisionModelWithProjection, cfg.CLIP_VISION_PATH, torch_dtype=dtype,
         )
 
         point_net = PointNet()
@@ -182,7 +185,9 @@ class MangaNinjaColorizer:
         self._clip_model = image_encoder
         try:
             from transformers import CLIPImageProcessor
-            self._clip_proc = CLIPImageProcessor.from_pretrained(cfg.CLIP_VISION_PATH)
+            from core.hf_offline import from_pretrained
+            self._clip_proc = from_pretrained(
+                CLIPImageProcessor, cfg.CLIP_VISION_PATH)
         except Exception:
             self._clip_proc = None
 

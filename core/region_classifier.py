@@ -65,15 +65,17 @@ class RegionClassifier:
             )
 
             device = "cuda" if torch.cuda.is_available() else "cpu"
+            from core.hf_offline import from_pretrained
             # The *WithProjection variants return .text_embeds/.image_embeds
             # explicitly — stable across transformers versions (CLIPModel's
             # get_text_features return type is not)
-            text_model = CLIPTextModelWithProjection.from_pretrained(
-                self._model_path).to(device).eval()
-            vision_model = CLIPVisionModelWithProjection.from_pretrained(
-                self._model_path).to(device).eval()
-            tokenizer = CLIPTokenizer.from_pretrained(self._model_path)
-            processor = CLIPImageProcessor.from_pretrained(self._model_path)
+            text_model = from_pretrained(
+                CLIPTextModelWithProjection, self._model_path).to(device).eval()
+            vision_model = from_pretrained(
+                CLIPVisionModelWithProjection, self._model_path).to(device).eval()
+            tokenizer = from_pretrained(CLIPTokenizer, self._model_path)
+            processor = from_pretrained(
+                CLIPImageProcessor, self._model_path)
 
             prompts = [_PROMPT.format(desc) for _, desc in REGION_LABELS]
             tokens = tokenizer(prompts, padding=True, return_tensors="pt")
