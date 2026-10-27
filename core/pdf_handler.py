@@ -3,7 +3,7 @@
 import os
 
 import cv2
-import fitz  # PyMuPDF
+import pymupdf as fitz  # PyMuPDF (v1.24+; `import fitz` is deprecated)
 
 
 def get_page_count(pdf_path: str) -> int:
