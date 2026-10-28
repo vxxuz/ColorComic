@@ -126,6 +126,7 @@
     let currentPage = null;
     let pageStartedAt = null;
     let avgSecondsPerPage = INITIAL_PAGE_ESTIMATE_SECONDS;
+    let hasMeasuredPage = false;
     const activePageStarts = new Map();
     const completedPageDurations = [];
 
@@ -197,10 +198,12 @@
             }
             if (typeof serverAvg === 'number' && serverAvg > 0) {
                 avgSecondsPerPage = serverAvg;
+                hasMeasuredPage = true;
             } else if (completedPageDurations.length) {
                 avgSecondsPerPage = completedPageDurations.reduce(
                     (sum, duration) => sum + duration, 0
                 ) / completedPageDurations.length;
+                hasMeasuredPage = true;
             }
         }
         activePageStarts.delete(page);
@@ -254,12 +257,22 @@
         const completed = pageStates.filter(state => state === 'done').length;
         const remaining = pageCount - completed;
         if (!remaining) return 0;
-        const per = Math.max(avgSecondsPerPage || INITIAL_PAGE_ESTIMATE_SECONDS, 1);
+        let per = Math.max(avgSecondsPerPage || INITIAL_PAGE_ESTIMATE_SECONDS, 1);
         const parallelism = Math.max(1, pageParallelism || 1);
         const now = Date.now();
-        const activeRemainders = [...activePageStarts.entries()]
+        const activeElapsed = [...activePageStarts.entries()]
             .filter(([page]) => pageStates[page] !== 'done')
-            .map(([, startedAt]) => Math.max(0, per - (now - startedAt) / 1000));
+            .map(([, startedAt]) => (now - startedAt) / 1000);
+        // Until a page actually finishes we have no real average. Use the
+        // longest in-flight page as a lower bound so a slow first page does
+        // not leave a confidently wrong static estimate on screen.
+        if (!hasMeasuredPage && activeElapsed.length) {
+            per = Math.max(per, Math.max(...activeElapsed));
+        }
+        const activeRemainders = activeElapsed.map(elapsed =>
+            // Never collapse to zero: an overdue page still needs time.
+            Math.max(per - elapsed, per * 0.25)
+        );
         if (activeRemainders.length) {
             const waiting = Math.max(0, remaining - activeRemainders.length);
             return Math.max(...activeRemainders)
@@ -328,7 +341,8 @@
             etaText.textContent = '';
             return;
         }
-        etaText.textContent = `Estimated time remaining: ${formatEta(seconds)}`;
+        const suffix = hasMeasuredPage ? '' : ' (estimating)';
+        etaText.textContent = `Estimated time remaining: ${formatEta(seconds)}${suffix}`;
     }
 
     function finish(kind, message) {
@@ -383,6 +397,7 @@
                 if (pageStates.length !== pageCount) buildPageProgress();
                 if (typeof data.avg_seconds_per_page === 'number' && data.avg_seconds_per_page > 0) {
                     avgSecondsPerPage = data.avg_seconds_per_page;
+                    hasMeasuredPage = true;
                 }
                 setProgress(data.processed_count || 0, data.total || pageCount);
                 setPageProgress(data.page_progress || 0, data.page);
@@ -441,6 +456,7 @@
         if (job.page_parallelism) pageParallelism = job.page_parallelism;
         if (typeof job.avg_seconds_per_page === 'number' && job.avg_seconds_per_page > 0) {
             avgSecondsPerPage = job.avg_seconds_per_page;
+            hasMeasuredPage = true;
         }
         if (pageStates.length !== pageCount) buildPageProgress();
         for (const page of (job.completed_pages || [])) {
@@ -452,6 +468,13 @@
         } else {
             setProgress(job.processed_count || 0, job.page_count || pageCount);
             if (typeof job.current_page === 'number' && job.page_count) {
+                // Resume the in-flight page from the server's elapsed time so a
+                // refresh does not restart the per-page estimate at zero.
+                if (typeof job.current_page_elapsed === 'number' && job.current_page_elapsed > 0) {
+                    activePageStarts.set(
+                        job.current_page, Date.now() - job.current_page_elapsed * 1000
+                    );
+                }
                 setPageStarted(job.current_page);
                 setPageProgress(job.page_progress || 0, job.current_page);
             }

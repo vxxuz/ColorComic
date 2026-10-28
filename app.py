@@ -644,12 +644,17 @@ def _eta_seconds(job: JobState) -> float | None:
         per = job.avg_seconds_per_page
     else:
         per = job.seconds_per_page_estimate
-    eta = remaining * per
-    if job.page_started_at is not None:
-        elapsed = time.time() - job.page_started_at
-        if elapsed > 0:
-            eta = max(0.0, eta - elapsed)
-    return eta
+    parallelism = max(1, job.page_parallelism or 1)
+    if job.page_started_at is None or parallelism > 1:
+        return remaining * per
+
+    # Sequential mode: `remaining` includes the page in flight, so count the
+    # waiting pages plus whatever is left of the current one.  Keep a floor so
+    # an overdue page does not collapse the countdown to "almost done".
+    elapsed = max(0.0, time.time() - job.page_started_at)
+    current_left = max(per - elapsed, per * 0.25)
+    waiting = max(0, remaining - 1)
+    return waiting * per + current_left
 
 
 # ── API: Colorize (ML pipeline) ─────────────────────────────────────────────
@@ -1166,6 +1171,10 @@ def job_info(job_id):
         "page_count": job.page_count,
         "page_progress": job.page_progress,
         "current_page": job.current_page,
+        "current_page_elapsed": (
+            round(time.time() - job.page_started_at, 1)
+            if job.page_started_at is not None else 0.0
+        ),
         "completed_pages": [
             i for i, path in enumerate(job.colorized_images) if path
         ],
