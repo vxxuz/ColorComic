@@ -294,7 +294,15 @@ def processing_view(job_id):
     job = jobs.get(job_id)
     if not job:
         return redirect(url_for("index"))
-    return render_template("processing.html", job=job)
+    return render_template(
+        "processing.html",
+        job=job,
+        estimated_page_seconds=job.seconds_per_page_estimate,
+        page_parallelism=(
+            job.page_parallelism
+            or (min(6, max(1, job.page_count)) if job.mode == "llm" else 1)
+        ),
+    )
 
 
 # ── API: Reference validator (pre-upload) ───────────────────────────────────
@@ -625,7 +633,9 @@ def _eta_seconds(job: JobState) -> float | None:
     """Estimate seconds until all remaining pages are done.
 
     Uses the smoothed per-page average once we have observations, falling
-    back to the quality preset's static estimate for the first page.
+    back to the quality preset's static estimate for the first page.  In
+    sequential mode the time already spent on the in-flight page is
+    subtracted so the countdown keeps moving between SSE events.
     """
     if job.processed_count >= job.page_count:
         return 0.0
@@ -634,7 +644,12 @@ def _eta_seconds(job: JobState) -> float | None:
         per = job.avg_seconds_per_page
     else:
         per = job.seconds_per_page_estimate
-    return remaining * per
+    eta = remaining * per
+    if job.page_started_at is not None:
+        elapsed = time.time() - job.page_started_at
+        if elapsed > 0:
+            eta = max(0.0, eta - elapsed)
+    return eta
 
 
 # ── API: Colorize (ML pipeline) ─────────────────────────────────────────────
@@ -663,12 +678,16 @@ def _colorize_pages_llm(job: JobState, colorizer, order: list[int],
     max_workers = min(6, max(1, len(order)))
 
     def _one(i: int) -> tuple[int, str]:
+        q.put({"status": "page_started", "page": i, "total": job.page_count,
+               "page_progress": 0.0, "eta_seconds": _eta_seconds(job)})
         with torch.inference_mode():
             return i, _colorize_one(job, colorizer, i, pp, consistency, None, None)
 
+    job.page_parallelism = max_workers
+    job.current_page = order[0]
     q.put({"status": "colorizing", "page": order[0],
            "processed_count": 0, "total": job.page_count,
-           "page_progress": 0.0})
+           "page_progress": 0.0, "eta_seconds": _eta_seconds(job)})
     batch_started_at = time.time()
     with ThreadPoolExecutor(max_workers=max_workers) as pool:
         futures = {pool.submit(_one, i): i for i in order}
@@ -727,7 +746,9 @@ def start_colorize(job_id):
     job.processed_count = 0
     job.page_progress = 0.0
     job.page_started_at = None
+    job.current_page = None
     job.avg_seconds_per_page = None
+    job.page_parallelism = min(6, max(1, job.page_count)) if job.mode == "llm" else 1
     job.eta_seconds = None
     job.colorized_images = []
     job.page_quality = []
@@ -803,6 +824,7 @@ def start_colorize(job_id):
                             if job.cancel_requested:
                                 raise _JobCancelled()
 
+                            job.current_page = i
                             job.page_started_at = time.time()
                             job.page_progress = 0.0
                             job.eta_seconds = _eta_seconds(job)
@@ -810,7 +832,8 @@ def start_colorize(job_id):
                                    "processed_count": job.processed_count,
                                    "status": "colorizing",
                                    "page_progress": 0.0,
-                                   "eta_seconds": job.eta_seconds})
+                                   "eta_seconds": job.eta_seconds,
+                                   "avg_seconds_per_page": job.avg_seconds_per_page})
 
                             last_emit = [None]
 
@@ -828,6 +851,7 @@ def start_colorize(job_id):
                                         "status": "colorizing",
                                         "page_progress": frac,
                                         "eta_seconds": job.eta_seconds,
+                                        "avg_seconds_per_page": job.avg_seconds_per_page,
                                     })
 
                             out_path = _colorize_one(
@@ -838,6 +862,7 @@ def start_colorize(job_id):
 
                             # Update the smoothed per-page duration EMA.
                             dur = time.time() - (job.page_started_at or time.time())
+                            job.page_started_at = None
                             prev_avg = job.avg_seconds_per_page
                             job.avg_seconds_per_page = (
                                 dur if prev_avg is None else 0.7 * prev_avg + 0.3 * dur
@@ -1140,8 +1165,13 @@ def job_info(job_id):
         "processed_count": job.processed_count,
         "page_count": job.page_count,
         "page_progress": job.page_progress,
+        "current_page": job.current_page,
+        "completed_pages": [
+            i for i, path in enumerate(job.colorized_images) if path
+        ],
         "avg_seconds_per_page": job.avg_seconds_per_page,
         "seconds_per_page_estimate": job.seconds_per_page_estimate,
+        "page_parallelism": job.page_parallelism,
         "eta_seconds": job.eta_seconds,
         "anchor_page_index": job.anchor_page_index,
         "style": job.style,

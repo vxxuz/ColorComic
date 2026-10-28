@@ -307,6 +307,65 @@ input:focus, select:focus, textarea:focus {
 #etaText {
     color: var(--accent);
     font-weight: 500;
+    font-variant-numeric: tabular-nums;
+}
+
+/* ── Per-page progress list ───────────────────────────────────────── */
+
+.page-progress-note {
+    margin: 0.25rem 0 0;
+    font-size: 0.76rem;
+}
+
+.page-progress-details {
+    text-align: left;
+    border-top: 1px solid var(--border);
+    padding-top: 0.75rem;
+}
+
+.page-progress-details summary {
+    color: var(--text-dim);
+    font-size: 0.9rem;
+    cursor: pointer;
+}
+
+.page-progress-list {
+    list-style: none;
+    margin: 0.65rem 0 0;
+    padding: 0 0.25rem 0 0;
+    max-height: 280px;
+    overflow-y: auto;
+}
+
+.page-progress-item {
+    padding: 0.45rem 0.2rem;
+    border-bottom: 1px solid var(--border);
+}
+
+.page-progress-meta {
+    display: flex;
+    justify-content: space-between;
+    gap: 0.75rem;
+    margin-bottom: 0.3rem;
+    font-size: 0.82rem;
+}
+
+.page-progress-status {
+    color: var(--text-dim);
+    font-variant-numeric: tabular-nums;
+    text-align: right;
+}
+
+.page-progress-item.is-active .page-progress-status {
+    color: var(--accent);
+}
+
+.page-progress-bar {
+    height: 5px;
+}
+
+.page-progress-bar .fill {
+    transition: width 0.8s ease;
 }
 
 /* ── Image Viewer ─────────────────────────────────────────────────── */

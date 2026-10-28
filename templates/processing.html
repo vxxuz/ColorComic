@@ -38,6 +38,12 @@
 
             <p class="hint mt-1" id="etaText" aria-live="polite"></p>
 
+            <details class="page-progress-details mt-2" id="pageProgressDetails" open>
+                <summary>Per-page progress (<span id="pageProgressSummary">0 / {{ job.page_count }}</span>)</summary>
+                <ol class="page-progress-list" id="pageProgressList" aria-label="Per-page progress"></ol>
+            </details>
+            <p class="hint page-progress-note">Per-page percentages for the active page and the ETA are estimates based on average page time.</p>
+
             <button class="btn btn-secondary mt-2" id="cancelBtn">Cancel job</button>
 
             <div id="previewArea" class="mt-2" hidden>
@@ -88,6 +94,8 @@
 <script>
     const JOB_ID = "{{ job.job_id }}";
     let pageCount = {{ job.page_count }};
+    const INITIAL_PAGE_ESTIMATE_SECONDS = {{ estimated_page_seconds | tojson }};
+    let pageParallelism = {{ page_parallelism | tojson }};
 
     const stepText = document.getElementById('stepText');
     const reconnectNotice = document.getElementById('reconnectNotice');
@@ -101,6 +109,8 @@
     const pagePct = document.getElementById('pagePct');
     const pageProgressWrap = document.getElementById('pageProgressWrap');
     const etaText = document.getElementById('etaText');
+    const pageProgressList = document.getElementById('pageProgressList');
+    const pageProgressSummary = document.getElementById('pageProgressSummary');
     const cancelBtn = document.getElementById('cancelBtn');
     const previewArea = document.getElementById('previewArea');
 
@@ -109,8 +119,154 @@
 
     let evtSource = null;
     let pollTimer = null;
+    let etaTimer = null;
     let lastEventTime = Date.now();
     let finished = false;
+    let pageStates = [];
+    let currentPage = null;
+    let pageStartedAt = null;
+    let avgSecondsPerPage = INITIAL_PAGE_ESTIMATE_SECONDS;
+    const activePageStarts = new Map();
+    const completedPageDurations = [];
+
+    function buildPageProgress() {
+        pageProgressList.replaceChildren();
+        pageStates = Array.from({ length: pageCount }, () => 'waiting');
+        for (let page = 0; page < pageCount; page++) {
+            const row = document.createElement('li');
+            row.className = 'page-progress-item';
+            row.id = `pageProgressItem${page}`;
+
+            const meta = document.createElement('div');
+            meta.className = 'page-progress-meta';
+            const name = document.createElement('span');
+            name.textContent = `Page ${page + 1}`;
+            const status = document.createElement('span');
+            status.className = 'page-progress-status';
+            status.id = `pageProgressStatus${page}`;
+            status.textContent = 'Waiting • 0%';
+            meta.append(name, status);
+
+            const bar = document.createElement('div');
+            bar.className = 'progress-bar page-progress-bar';
+            bar.setAttribute('role', 'progressbar');
+            bar.setAttribute('aria-label', `Progress for page ${page + 1}`);
+            bar.setAttribute('aria-valuemin', '0');
+            bar.setAttribute('aria-valuemax', '100');
+            bar.setAttribute('aria-valuenow', '0');
+            const fill = document.createElement('div');
+            fill.className = 'fill';
+            fill.id = `pageProgressFill${page}`;
+            fill.style.width = '0%';
+            bar.append(fill);
+            row.append(meta, bar);
+            pageProgressList.append(row);
+        }
+        pageProgressSummary.textContent = `0 / ${pageCount}`;
+    }
+
+    function setPageStarted(page) {
+        if (!Number.isInteger(page) || page < 0 || page >= pageCount) return;
+        if (pageStates[page] === 'done') return;
+        pageStates[page] = 'active';
+        if (!activePageStarts.has(page)) activePageStarts.set(page, Date.now());
+        currentPage = page;
+        pageStartedAt = activePageStarts.get(page);
+        const row = document.getElementById(`pageProgressItem${page}`);
+        const status = document.getElementById(`pageProgressStatus${page}`);
+        if (row) row.classList.add('is-active');
+        const elapsed = (Date.now() - activePageStarts.get(page)) / 1000;
+        const per = Math.max(avgSecondsPerPage || INITIAL_PAGE_ESTIMATE_SECONDS, 1);
+        const pct = Math.min(95, Math.floor((elapsed / per) * 100));
+        if (status) {
+            status.textContent = elapsed >= 1
+                ? `Processing • ~${pct}% • ${formatEta(elapsed)}`
+                : `Processing • ~${pct}%`;
+        }
+        updatePageProgress();
+        updateEta(etaFromState());
+    }
+
+    function setPageDone(page, serverAvg) {
+        if (!Number.isInteger(page) || page < 0 || page >= pageCount) return;
+        if (pageStates[page] !== 'done') {
+            pageStates[page] = 'done';
+            const startedAt = activePageStarts.get(page);
+            if (startedAt) {
+                completedPageDurations.push((Date.now() - startedAt) / 1000);
+            }
+            if (typeof serverAvg === 'number' && serverAvg > 0) {
+                avgSecondsPerPage = serverAvg;
+            } else if (completedPageDurations.length) {
+                avgSecondsPerPage = completedPageDurations.reduce(
+                    (sum, duration) => sum + duration, 0
+                ) / completedPageDurations.length;
+            }
+        }
+        activePageStarts.delete(page);
+        if (currentPage === page) {
+            currentPage = null;
+            pageStartedAt = null;
+        }
+        const row = document.getElementById(`pageProgressItem${page}`);
+        const status = document.getElementById(`pageProgressStatus${page}`);
+        const bar = document.querySelector(`#pageProgressItem${page} .page-progress-bar`);
+        const fill = document.getElementById(`pageProgressFill${page}`);
+        if (row) row.classList.remove('is-active');
+        if (fill) fill.style.width = '100%';
+        if (bar) bar.setAttribute('aria-valuenow', '100');
+        if (status) status.textContent = 'Done • 100%';
+        updatePageProgress();
+        updateEta(etaFromState());
+    }
+
+    function updatePageProgress() {
+        const completed = pageStates.filter(state => state === 'done').length;
+        pageProgressSummary.textContent = `${completed} / ${pageCount}`;
+        colorCounter.textContent = `${completed} / ${pageCount}`;
+    }
+
+    // Keep active page percentages and the ETA moving between server events.
+    function tickProgress() {
+        if (finished) return;
+        const now = Date.now();
+        const per = Math.max(avgSecondsPerPage || INITIAL_PAGE_ESTIMATE_SECONDS, 1);
+        for (const [page, startedAt] of activePageStarts) {
+            if (pageStates[page] === 'done') continue;
+            const elapsed = (now - startedAt) / 1000;
+            const pct = Math.min(95, Math.floor((elapsed / per) * 100));
+            const fill = document.getElementById(`pageProgressFill${page}`);
+            const bar = document.querySelector(`#pageProgressItem${page} .page-progress-bar`);
+            const status = document.getElementById(`pageProgressStatus${page}`);
+            if (fill) fill.style.width = `${pct}%`;
+            if (bar) bar.setAttribute('aria-valuenow', String(pct));
+            if (status) status.textContent = `Processing • ~${pct}% • ${formatEta(elapsed)}`;
+        }
+        if (currentPage !== null && pageStartedAt !== null) {
+            const elapsed = (now - pageStartedAt) / 1000;
+            setPageProgress(Math.min(95, Math.floor((elapsed / per) * 100)) / 100, currentPage);
+        }
+        updateEta(etaFromState());
+    }
+
+    function etaFromState() {
+        if (!pageCount) return null;
+        const completed = pageStates.filter(state => state === 'done').length;
+        const remaining = pageCount - completed;
+        if (!remaining) return 0;
+        const per = Math.max(avgSecondsPerPage || INITIAL_PAGE_ESTIMATE_SECONDS, 1);
+        const parallelism = Math.max(1, pageParallelism || 1);
+        const now = Date.now();
+        const activeRemainders = [...activePageStarts.entries()]
+            .filter(([page]) => pageStates[page] !== 'done')
+            .map(([, startedAt]) => Math.max(0, per - (now - startedAt) / 1000));
+        if (activeRemainders.length) {
+            const waiting = Math.max(0, remaining - activeRemainders.length);
+            return Math.max(...activeRemainders)
+                + Math.ceil(waiting / parallelism) * per;
+        }
+        return Math.ceil(remaining / parallelism) * per;
+    }
 
     function showState(id) {
         for (const s of ['processingActive', 'processingDone', 'processingError', 'processingCancelled']) {
@@ -180,6 +336,7 @@
         finished = true;
         if (evtSource) evtSource.close();
         if (pollTimer) clearInterval(pollTimer);
+        if (etaTimer) clearInterval(etaTimer);
         if (kind === 'done') {
             showState('processingDone');
         } else if (kind === 'cancelled') {
@@ -223,15 +380,29 @@
                 break;
             case 'colorizing':
                 if (typeof data.total === 'number') pageCount = data.total;
+                if (pageStates.length !== pageCount) buildPageProgress();
+                if (typeof data.avg_seconds_per_page === 'number' && data.avg_seconds_per_page > 0) {
+                    avgSecondsPerPage = data.avg_seconds_per_page;
+                }
                 setProgress(data.processed_count || 0, data.total || pageCount);
                 setPageProgress(data.page_progress || 0, data.page);
+                setPageStarted(data.page);
                 updateEta(data.eta_seconds);
+                setStep(`Colorizing page ${data.page + 1}…`);
+                break;
+            case 'page_started':
+                if (typeof data.total === 'number') pageCount = data.total;
+                if (pageStates.length !== pageCount) buildPageProgress();
+                setPageStarted(data.page);
+                if (typeof data.eta_seconds === 'number') updateEta(data.eta_seconds);
                 setStep(`Colorizing page ${data.page + 1}…`);
                 break;
             case 'done_page':
                 if (typeof data.total === 'number') pageCount = data.total;
+                if (pageStates.length !== pageCount) buildPageProgress();
                 setProgress(data.processed_count, data.total || pageCount);
                 setPageProgress(1, data.page);
+                setPageDone(data.page, data.avg_seconds_per_page);
                 updateEta(data.eta_seconds);
                 updateThumbs(data.page);
                 break;
@@ -267,13 +438,22 @@
         if (job.status === 'cancelled') { finish('cancelled'); return true; }
 
         if (job.page_count) pageCount = job.page_count;
+        if (job.page_parallelism) pageParallelism = job.page_parallelism;
+        if (typeof job.avg_seconds_per_page === 'number' && job.avg_seconds_per_page > 0) {
+            avgSecondsPerPage = job.avg_seconds_per_page;
+        }
+        if (pageStates.length !== pageCount) buildPageProgress();
+        for (const page of (job.completed_pages || [])) {
+            setPageDone(page, job.avg_seconds_per_page);
+        }
         if (job.status === 'extracting') {
             setStep('Extracting pages…');
             setIndeterminate(true);
         } else {
             setProgress(job.processed_count || 0, job.page_count || pageCount);
-            if (job.page_count && job.processed_count > 0) {
-                setPageProgress(job.page_progress || 0, job.processed_count - 1);
+            if (typeof job.current_page === 'number' && job.page_count) {
+                setPageStarted(job.current_page);
+                setPageProgress(job.page_progress || 0, job.current_page);
             }
             updateEta(job.eta_seconds);
             if (job.current_step) setStep(job.current_step);
@@ -294,6 +474,10 @@
             cancelBtn.textContent = 'Cancel job';
         }
     });
+
+    buildPageProgress();
+    updateEta(etaFromState());
+    etaTimer = setInterval(tickProgress, 1000);
 
     (async () => {
         // Check job state first so a refresh after completion shows the right

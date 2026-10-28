@@ -43,8 +43,11 @@ class JobState(BaseModel):
     # when the current page was started, and a smoothed seconds-per-page EMA.
     page_progress: float = 0.0
     page_started_at: Optional[float] = None
+    current_page: Optional[int] = None
     avg_seconds_per_page: Optional[float] = None
     seconds_per_page_estimate: float = 5.0
+    # Pages colorized concurrently (1 for local pipelines, up to 6 for LLM mode).
+    page_parallelism: int = 1
     # Remaining-seconds estimate computed from the above (surfaced to UI).
     eta_seconds: Optional[float] = None
     current_step: str = ""
