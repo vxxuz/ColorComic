@@ -31,6 +31,7 @@ class JobState(BaseModel):
 
     job_id: str
     pdf_path: str
+    source_type: str = "pdf"  # pdf or uploaded image(s)
     page_count: int
     page_images: list[str] = []
     colorized_images: list[str] = []

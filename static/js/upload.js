@@ -8,12 +8,16 @@ const fileInfo = document.getElementById('fileInfo');
 const dropError = document.getElementById('dropError');
 const dropNote = document.getElementById('dropNote');
 
-let selectedFile = null;
+let selectedFiles = [];
 
-// ── PDF Drag and Drop ───────────────────────────────────────────────────────
+// ── PDF and direct photo upload ──────────────────────────────────────────────
 
 function isPdfFile(file) {
     return file.name.toLowerCase().endsWith('.pdf');
+}
+
+function isComicImage(file) {
+    return /\.(png|jpe?g|webp|bmp|tiff?)$/i.test(file.name);
 }
 
 function showDropError(msg) {
@@ -59,26 +63,43 @@ dropZone.addEventListener('drop', e => {
     dropZone.classList.remove('dragover');
     const files = Array.from(e.dataTransfer.files);
     if (!files.length) return;
-    const pdfs = files.filter(isPdfFile);
-    if (!pdfs.length) {
-        showDropError('Only PDF files are supported');
-        return;
-    }
-    selectFile(pdfs[0]);
-    if (files.length > 1) {
-        showDropNote(`Using "${pdfs[0].name}" — ${files.length - 1} other file(s) ignored.`);
-    }
+    selectFiles(files);
 });
 
 fileInput.addEventListener('change', () => {
-    if (fileInput.files.length) selectFile(fileInput.files[0]);
+    if (fileInput.files.length) selectFiles(Array.from(fileInput.files));
 });
 
-function selectFile(file) {
+function selectFiles(files) {
     clearDropMessages();
-    selectedFile = file;
-    document.getElementById('fileName').textContent = file.name;
-    const sizeMB = (file.size / (1024 * 1024)).toFixed(1);
+    const pdfs = files.filter(isPdfFile);
+    const images = files.filter(isComicImage);
+    if (pdfs.length && (pdfs.length !== 1 || files.length !== 1)) {
+        selectedFiles = [];
+        fileInfo.hidden = true;
+        showDropError('Choose either one PDF or one or more image files.');
+        updateUploadButtonState();
+        return;
+    }
+    if (!pdfs.length && images.length !== files.length) {
+        selectedFiles = [];
+        fileInfo.hidden = true;
+        showDropError('Supported files: PDF, JPG, PNG, WEBP, BMP, or TIFF.');
+        updateUploadButtonState();
+        return;
+    }
+
+    selectedFiles = files;
+    if (pdfs.length) {
+        document.getElementById('fileName').textContent = pdfs[0].name;
+    } else {
+        const names = images.slice(0, 3).map(file => file.name).join(', ');
+        const more = images.length > 3 ? ` and ${images.length - 3} more` : '';
+        document.getElementById('fileName').textContent = `${images.length} photo(s): ${names}${more}`;
+        showDropNote('Photos will be processed in the order selected.');
+    }
+    const totalBytes = files.reduce((sum, file) => sum + file.size, 0);
+    const sizeMB = (totalBytes / (1024 * 1024)).toFixed(1);
     document.getElementById('fileSize').textContent = `(${sizeMB} MB)`;
     fileInfo.hidden = false;
     updateUploadButtonState();
@@ -275,8 +296,8 @@ async function validateReferenceEntry(entry) {
 function updateUploadButtonState() {
     const mode = getSelectedMode();
     let hint = '';
-    if (!selectedFile) {
-        hint = 'Select a PDF to continue';
+    if (!selectedFiles.length) {
+        hint = 'Select a PDF or one or more photos to continue';
     } else if (mode === 'reference' && refEntries.length === 0) {
         hint = 'Reference mode needs at least one reference image';
     }
@@ -411,11 +432,11 @@ function sendUpload(formData) {
 }
 
 uploadBtn.addEventListener('click', async () => {
-    if (!selectedFile) return;
+    if (!selectedFiles.length) return;
     uploadBtn.disabled = true;
 
     const formData = new FormData();
-    formData.append('file', selectedFile);
+    for (const file of selectedFiles) formData.append('file', file);
 
     const mode = getSelectedMode();
     formData.append('mode', mode);

@@ -7,7 +7,7 @@
     <div class="card mt-3 onboarding-card">
         <h3 class="onboarding-title">How it works</h3>
         <ol class="onboarding-steps">
-            <li><strong>Upload</strong> a B&W comic PDF.</li>
+            <li><strong>Upload</strong> a B&W comic PDF or one or more photos.</li>
             <li>Pick a <strong>style</strong> (Shonen, Webtoon, Marvel, …) and a <strong>quality</strong> (Draft / Standard / Ultra).</li>
             <li>Optional: add <strong>reference pages</strong> to lock in a palette.</li>
             <li>Watch live previews and re-roll any page that misses.</li>
@@ -15,17 +15,20 @@
     </div>
 
     <div class="card mt-3">
-        <h2 class="card-title">Upload B&W Comic PDF</h2>
+        <h2 class="card-title">Upload Comic PDF or Photos</h2>
 
         <div class="upload-zone" id="dropZone" role="button" tabindex="0"
-             aria-label="Upload a B&W comic PDF. Press Enter to browse files, or drop a PDF here.">
-            <div class="icon" aria-hidden="true">&#128196;</div>
-            <p><strong>Drop your PDF here</strong></p>
+             aria-label="Upload a comic PDF or photos. Press Enter to browse files, or drop files here.">
+            <div class="icon" aria-hidden="true">&#128247;</div>
+            <p><strong>Drop a PDF or comic photos here</strong></p>
             <p>or click to browse</p>
+            <p class="hint">One PDF, or one or more JPG, PNG, WEBP, BMP, or TIFF images</p>
+            <p class="hint">Selected photos become pages in the downloadable colored PDF.</p>
             <p id="dropError" class="drop-error" hidden></p>
             <p id="dropNote" class="drop-note" hidden></p>
-            <input type="file" id="fileInput" class="sr-only" accept=".pdf"
-                   aria-label="Choose a PDF file">
+            <input type="file" id="fileInput" class="sr-only"
+                   accept=".pdf,image/png,image/jpeg,image/webp,image/bmp,image/tiff" multiple
+                   aria-label="Choose a PDF or comic photos">
         </div>
 
         <div id="fileInfo" class="file-info" hidden>
@@ -179,7 +182,7 @@
         <button class="btn btn-primary mt-2" id="uploadBtn" style="width:100%;" disabled>
             Upload &amp; Colorize
         </button>
-        <p id="submitHint" class="hint text-center" aria-live="polite">Select a PDF to continue</p>
+        <p id="submitHint" class="hint text-center" aria-live="polite">Select a PDF or one or more photos to continue</p>
 
         <div id="uploadProgress" class="mt-2" hidden>
             <div class="progress-bar" id="uploadBar" role="progressbar"

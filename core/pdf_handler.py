@@ -4,6 +4,7 @@ import os
 
 import cv2
 import pymupdf as fitz  # PyMuPDF (v1.24+; `import fitz` is deprecated)
+from PIL import Image, ImageOps
 
 
 def get_page_count(pdf_path: str) -> int:
@@ -30,6 +31,22 @@ def extract_pages(pdf_path: str, output_dir: str, dpi: int = 300,
             out_path = os.path.join(output_dir, f"page_{i:04d}.png")
             pix.save(out_path)
             paths.append(out_path)
+    return paths
+
+
+def extract_image_files(image_paths: list[str], output_dir: str,
+                        should_stop=None) -> list[str]:
+    """Normalize uploaded photos into ordered PNG page images."""
+    os.makedirs(output_dir, exist_ok=True)
+    paths = []
+    for i, image_path in enumerate(image_paths):
+        if should_stop is not None and should_stop():
+            break
+        out_path = os.path.join(output_dir, f"page_{i:04d}.png")
+        with Image.open(image_path) as image:
+            image = ImageOps.exif_transpose(image).convert("RGB")
+            image.save(out_path, format="PNG")
+        paths.append(out_path)
     return paths
 
 
@@ -65,10 +82,11 @@ def reassemble_pdf(
             # Header-only size read — decoding a full 100+ MB PNG just for
             # its dimensions is wasteful
             try:
-                from PIL import Image
                 with Image.open(img_path) as im:
                     iw, ih = im.size
-                w, h = float(iw), float(ih)
+                # Treat standalone photos as 300-DPI scans for practical PDF
+                # page dimensions while keeping their original aspect ratio.
+                w, h = float(iw) * 72.0 / 300.0, float(ih) * 72.0 / 300.0
             except Exception:
                 w, h = 612.0, 792.0  # US Letter fallback
 

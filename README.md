@@ -1,8 +1,9 @@
 # ColorComic
 
 Colorize black-and-white comic and manga pages with deep learning — and make them
-look **hand-colored, not washed over**. Upload a PDF, get back a fully colorized
-version where skin, hair, clothes, and backgrounds each get their own color.
+look **hand-colored, not washed over**. Upload a PDF or one or more photos, get
+back a fully colorized version where skin, hair, clothes, and backgrounds each
+get their own color.
 Auto and reference modes run entirely on your machine; an optional text-only LLM
 can direct the palette.
 
@@ -43,14 +44,14 @@ can direct the palette.
   models are parked on CPU RAM so switching back is fast. Safe for 8 GB GPUs.
 - **Live preview & editing** — real-time progress, A/B slider, per-page re-roll,
   paint-bucket touch-up with undo, per-page CMYK export.
-- **PDF in, PDF out**, with automatic weight downloads on first use.
+- **PDF or photo input, PDF output**, with automatic weight downloads on first use.
 
 ## How It Works
 
 ### Auto Mode (guided coloring + post-processing)
 
 ```
-Upload PDF → extract pages (300 DPI, background thread)
+Upload PDF or photos → extract/normalize pages (background thread)
   → Build the book's color script once:
       segment anchor page into regions → CLIP labels them
       → color director picks a palette (static, or text-only LLM)
@@ -73,7 +74,7 @@ global cast.
 ### Reference Mode (MangaNinja)
 
 ```
-Upload PDF + reference image(s) → extract pages
+Upload PDF or photos + reference image(s) → extract pages
   → For each page:
       MangaNinja colorize (reference attention, DPM-Solver++ ~16 steps)
       → post-processing
@@ -88,7 +89,7 @@ are computed once and reused across all pages.
 ### LLM Mode (OpenRouter image model)
 
 ```
-Upload PDF → extract pages
+Upload PDF or photos → extract pages
   → For each page: send image to an OpenRouter image model → receive colorized page
   → post-processing → reassemble PDF
 ```
@@ -189,7 +190,7 @@ Open **http://127.0.0.1:5000**. Weights download automatically on first use.
 
 ## Usage
 
-1. **Upload** a B&W comic/manga PDF.
+1. **Upload** a B&W comic/manga PDF or one or more JPG, PNG, WEBP, BMP, or TIFF photos.
 2. **Choose a mode** — Auto, Reference (+ a colored reference image), or LLM.
 3. **Pick a style + quality** — e.g. *Manhwa Flat Color* + *Standard*.
 4. *(Auto mode)* optionally toggle the **AI color director**.
@@ -274,7 +275,7 @@ ColorComic/
 | Method | Endpoint | Description |
 |---|---|---|
 | `GET` | `/` | Upload page |
-| `POST` | `/upload` | Upload PDF (+ references, mode, style, quality, director toggle) |
+| `POST` | `/upload` | Upload one PDF or multiple photos (+ references, mode, style, quality, director toggle) |
 | `POST` | `/api/validate-reference` | Pre-flight check for a reference image |
 | `POST` | `/api/colorize/<job_id>` | Start colorization |
 | `POST` | `/api/cancel/<job_id>` | Cancel a running job |

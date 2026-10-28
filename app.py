@@ -26,6 +26,8 @@ from flask import (
     send_file,
     url_for,
 )
+from PIL import Image
+from werkzeug.utils import secure_filename
 
 from config import Config
 from core.character_memory import CharacterMemory
@@ -36,7 +38,12 @@ from core.model_manager import ModelManager
 from core.model_downloader import ensure_models_downloaded
 from core.output_writer import write_image, write_cmyk_tiff, write_preview
 from core.paint_bucket import flood_recolor
-from core.pdf_handler import extract_pages, get_page_count, reassemble_pdf
+from core.pdf_handler import (
+    extract_image_files,
+    extract_pages,
+    get_page_count,
+    reassemble_pdf,
+)
 from core.postprocessor import PostProcessor
 from core.presets import (
     all_qualities_json,
@@ -162,7 +169,7 @@ def _friendly_error(exc: Exception) -> str:
         return ("The GPU ran out of memory — try the Draft quality preset "
                 "or switch the device to CPU and retry.")
     if "cannot read image" in low or "no such file" in low:
-        return "A page image could not be read — try re-uploading the PDF."
+        return "A page image could not be read — try re-uploading the source file."
     if "connection" in low or "timed out" in low or "timeout" in low:
         return ("Network problem while calling the colorization API — "
                 "check your connection and try again.")
@@ -327,13 +334,19 @@ def api_validate_reference():
 # ── API: Upload ──────────────────────────────────────────────────────────────
 
 
-def _extract_job_pages(job: JobState, pdf_path: str, pages_dir: str):
+def _extract_job_pages(job: JobState, source_paths: list[str], pages_dir: str):
     """Background page extraction + anchor detection (runs off-request)."""
     try:
-        job.page_images = extract_pages(
-            pdf_path, pages_dir, dpi=Config.PAGE_DPI,
-            should_stop=lambda: job.cancel_requested,
-        )
+        should_stop = lambda: job.cancel_requested
+        if job.source_type == "pdf":
+            job.page_images = extract_pages(
+                source_paths[0], pages_dir, dpi=Config.PAGE_DPI,
+                should_stop=should_stop,
+            )
+        else:
+            job.page_images = extract_image_files(
+                source_paths, pages_dir, should_stop=should_stop,
+            )
         if job.cancel_requested:
             log.info("job %s: extraction aborted by cancel", job.job_id)
             return
@@ -351,12 +364,30 @@ def _extract_job_pages(job: JobState, pdf_path: str, pages_dir: str):
 
 
 @app.route("/upload", methods=["POST"])
-def upload_pdf():
-    if "file" not in request.files:
-        return jsonify({"error": "No file uploaded"}), 400
-    f = request.files["file"]
-    if not f.filename or not f.filename.lower().endswith(".pdf"):
-        return jsonify({"error": "Only PDF files are accepted"}), 400
+def upload_input():
+    uploads = [f for f in request.files.getlist("file") if f.filename]
+    if not uploads:
+        return jsonify({"error": "Upload one PDF or one or more comic photos"}), 400
+
+    allowed_image_exts = {".png", ".jpg", ".jpeg", ".webp", ".bmp", ".tif", ".tiff"}
+    extensions = [os.path.splitext(f.filename)[1].lower() for f in uploads]
+    pdf_uploads = [i for i, ext in enumerate(extensions) if ext == ".pdf"]
+    if pdf_uploads:
+        if len(uploads) != 1:
+            return jsonify({"error": "Upload either one PDF or image files, not both"}), 400
+        source_type = "pdf"
+    else:
+        if any(ext not in allowed_image_exts for ext in extensions):
+            return jsonify({
+                "error": "Supported inputs are one PDF or PNG, JPG, WEBP, BMP, and TIFF photos"
+            }), 400
+        source_type = "images"
+        for f in uploads:
+            try:
+                Image.open(f.stream).verify()
+                f.stream.seek(0)
+            except Exception:
+                return jsonify({"error": f"Could not read image: {f.filename}"}), 400
 
     style_label = request.form.get("style_label", "auto")  # legacy: manga/western/auto
     style = request.form.get("style", Config.DEFAULT_STYLE)
@@ -379,10 +410,23 @@ def upload_pdf():
     job_dir = os.path.join(Config.UPLOAD_FOLDER, job_id)
     os.makedirs(job_dir, exist_ok=True)
 
-    pdf_path = os.path.join(job_dir, f.filename)
-    f.save(pdf_path)
+    source_paths = []
+    for i, f in enumerate(uploads):
+        clean_name = secure_filename(f.filename) or f"upload_{i}"
+        saved_path = os.path.join(job_dir, f"source_{i:04d}_{clean_name}")
+        f.save(saved_path)
+        source_paths.append(saved_path)
 
-    page_count = get_page_count(pdf_path)  # cheap — no rasterization
+    source_path = source_paths[0]
+    if source_type == "pdf":
+        try:
+            page_count = get_page_count(source_path)  # cheap — no rasterization
+        except Exception as exc:
+            return jsonify({"error": f"Could not read PDF: {exc}"}), 400
+        if page_count < 1:
+            return jsonify({"error": "The PDF contains no pages"}), 400
+    else:
+        page_count = len(source_paths)
 
     # Collect references — multi-ref list takes precedence
     reference_paths: list[str] = []
@@ -409,7 +453,8 @@ def upload_pdf():
 
     job = JobState(
         job_id=job_id,
-        pdf_path=pdf_path,
+        pdf_path=source_path,
+        source_type=source_type,
         page_count=page_count,
         page_images=[],
         style=style,
@@ -430,7 +475,7 @@ def upload_pdf():
     # upload response on it
     pages_dir = os.path.join(job_dir, "pages")
     threading.Thread(
-        target=_extract_job_pages, args=(job, pdf_path, pages_dir),
+        target=_extract_job_pages, args=(job, source_paths, pages_dir),
         daemon=True, name=f"extract-{job_id}",
     ).start()
 
@@ -896,7 +941,8 @@ def start_colorize(job_id):
                 ordered_paths = [job.colorized_images[i] for i in range(job.page_count)
                                  if i < len(job.colorized_images) and job.colorized_images[i]]
                 output_pdf = os.path.join(Config.OUTPUT_FOLDER, job_id, "colorized.pdf")
-                reassemble_pdf(ordered_paths, output_pdf, job.pdf_path)
+                source_pdf = job.pdf_path if job.source_type == "pdf" else None
+                reassemble_pdf(ordered_paths, output_pdf, source_pdf)
                 job.output_pdf = output_pdf
 
                 # Optional CMYK TIFF for first page (full book CMYK is heavy;
@@ -1169,6 +1215,7 @@ def job_info(job_id):
         "progress": job.progress,
         "processed_count": job.processed_count,
         "page_count": job.page_count,
+        "source_type": job.source_type,
         "page_progress": job.page_progress,
         "current_page": job.current_page,
         "current_page_elapsed": (
