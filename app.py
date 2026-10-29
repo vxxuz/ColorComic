@@ -103,8 +103,9 @@ def _thread_excepthook(args):
 
 threading.excepthook = _thread_excepthook
 
-# Enable cudnn autotuner for consistent input sizes
-torch.backends.cudnn.benchmark = True
+# cudnn/MIOpen autotuning is opt-in: on ROCm, benchmark=True forces an
+# exhaustive kernel search per conv shape (minutes each on gfx1031).
+torch.backends.cudnn.benchmark = os.environ.get("COLORCOMIC_CUDNN_BENCHMARK", "0") == "1"
 
 app = Flask(__name__)
 app.config.from_object(Config)
@@ -674,6 +675,30 @@ def _format_eta(seconds: float | None) -> str | None:
     return f"{h}h {m}m"
 
 
+def _per_page_seconds(job: JobState) -> float:
+    """Expected duration of one page (smoothed average, else preset hint)."""
+    per = job.avg_seconds_per_page or job.seconds_per_page_estimate or 5.0
+    return max(0.2, float(per))
+
+
+def _page_eta_seconds(job: JobState) -> float | None:
+    """Seconds left for the page currently being colorized."""
+    if job.processed_count >= job.page_count:
+        return 0.0
+    per = _per_page_seconds(job)
+    frac = max(0.0, min(1.0, job.page_progress or 0.0))
+    if job.page_started_at is not None:
+        elapsed = max(0.0, time.time() - job.page_started_at)
+        if frac < 1.0 and elapsed > 0.0:
+            # Prefer the observed rate once enough of the page is done,
+            # otherwise project from the preset/preset-derived average.
+            left = (elapsed / frac - elapsed) if frac >= 0.05 else (per - elapsed)
+            # Keep the 25% floor used by _eta_seconds: an overdue page still
+            # needs time, so it must not collapse the countdown to "almost done".
+            return max(left, per * 0.25)
+    return max(per * (1.0 - frac), per * 0.25)
+
+
 def _eta_seconds(job: JobState) -> float | None:
     """Estimate seconds until all remaining pages are done.
 
@@ -685,21 +710,33 @@ def _eta_seconds(job: JobState) -> float | None:
     if job.processed_count >= job.page_count:
         return 0.0
     remaining = job.page_count - job.processed_count
-    if job.avg_seconds_per_page:
-        per = job.avg_seconds_per_page
-    else:
-        per = job.seconds_per_page_estimate
+    per = _per_page_seconds(job)
     parallelism = max(1, job.page_parallelism or 1)
     if job.page_started_at is None or parallelism > 1:
         return remaining * per
 
     # Sequential mode: `remaining` includes the page in flight, so count the
-    # waiting pages plus whatever is left of the current one.  Keep a floor so
-    # an overdue page does not collapse the countdown to "almost done".
-    elapsed = max(0.0, time.time() - job.page_started_at)
-    current_left = max(per - elapsed, per * 0.25)
+    # waiting pages plus whatever is left of the current one.
     waiting = max(0, remaining - 1)
-    return waiting * per + current_left
+    return waiting * per + (_page_eta_seconds(job) or 0.0)
+
+
+def _sync_progress(job: JobState) -> None:
+    """Refresh overall progress + ETA from processed pages and page fraction.
+
+    The bar is weighted by actual work: a finished page counts as 1, the page
+    in flight counts as its reported fraction. Without this, the overall bar
+    stands still for the whole duration of every page.
+    """
+    total = job.page_count or 0
+    if total <= 0:
+        job.progress = 0.0
+        job.eta_seconds = _eta_seconds(job)
+        return
+    done = max(0, min(job.processed_count, total))
+    frac = 1.0 if done >= total else max(0.0, min(1.0, job.page_progress or 0.0))
+    job.progress = 1.0 if done >= total else min(0.999, (done + frac) / total)
+    job.eta_seconds = _eta_seconds(job)
 
 
 # ── API: Colorize (ML pipeline) ─────────────────────────────────────────────
@@ -729,6 +766,7 @@ def _colorize_pages_llm(job: JobState, colorizer, order: list[int],
 
     def _one(i: int) -> tuple[int, str]:
         q.put({"status": "page_started", "page": i, "total": job.page_count,
+               "progress": job.progress,
                "page_progress": 0.0, "eta_seconds": _eta_seconds(job)})
         with torch.inference_mode():
             return i, _colorize_one(job, colorizer, i, pp, consistency, None, None)
@@ -737,6 +775,7 @@ def _colorize_pages_llm(job: JobState, colorizer, order: list[int],
     job.current_page = order[0]
     q.put({"status": "colorizing", "page": order[0],
            "processed_count": 0, "total": job.page_count,
+           "progress": job.progress,
            "page_progress": 0.0, "eta_seconds": _eta_seconds(job)})
     batch_started_at = time.time()
     with ThreadPoolExecutor(max_workers=max_workers) as pool:
@@ -757,9 +796,10 @@ def _colorize_pages_llm(job: JobState, colorizer, order: list[int],
                 dur if prev_avg is None else 0.7 * prev_avg + 0.3 * dur
             )
             job.processed_count += 1
-            job.progress = job.processed_count / job.page_count
-            job.page_progress = 1.0
-            job.eta_seconds = _eta_seconds(job)
+            # The finished page is now counted in processed_count; clear its
+            # fraction so the worked-in fraction is not double-counted.
+            job.page_progress = 0.0
+            _sync_progress(job)
             quality_record = (
                 job.page_quality[i].model_dump()
                 if i < len(job.page_quality) else None
@@ -769,6 +809,7 @@ def _colorize_pages_llm(job: JobState, colorizer, order: list[int],
                 "total": job.page_count,
                 "processed_count": job.processed_count,
                 "status": "done_page",
+                "progress": job.progress,
                 "page_progress": 1.0,
                 "avg_seconds_per_page": job.avg_seconds_per_page,
                 "eta_seconds": job.eta_seconds,
@@ -808,7 +849,7 @@ def start_colorize(job_id):
         job.seconds_per_page_estimate = get_quality(job.quality).seconds_per_page_estimate
     except Exception:
         job.seconds_per_page_estimate = 5.0
-    job.eta_seconds = _eta_seconds(job)
+    _sync_progress(job)
     q = queue.Queue()
     job_queues[job_id] = q
 
@@ -877,10 +918,11 @@ def start_colorize(job_id):
                             job.current_page = i
                             job.page_started_at = time.time()
                             job.page_progress = 0.0
-                            job.eta_seconds = _eta_seconds(job)
+                            _sync_progress(job)
                             q.put({"page": i, "total": job.page_count,
                                    "processed_count": job.processed_count,
                                    "status": "colorizing",
+                                   "progress": job.progress,
                                    "page_progress": 0.0,
                                    "eta_seconds": job.eta_seconds,
                                    "avg_seconds_per_page": job.avg_seconds_per_page})
@@ -888,18 +930,24 @@ def start_colorize(job_id):
                             last_emit = [None]
 
                             def _page_cb(frac):
-                                job.page_progress = frac
+                                # Real progress from the tiled / per-panel /
+                                # diffusion paths — never move backwards and
+                                # never show 100% before post-processing ends.
+                                new = max(job.page_progress or 0.0,
+                                          min(0.98, float(frac)))
+                                job.page_progress = new
                                 # Emit a lightweight event at ~1% page-granularity
                                 # so the bar animates smoothly during long pages.
-                                bucket = int(frac * 100)
+                                bucket = int(new * 100)
                                 if last_emit[0] is None or bucket >= last_emit[0] + 2:
                                     last_emit[0] = bucket
-                                    job.eta_seconds = _eta_seconds(job)
+                                    _sync_progress(job)
                                     q.put({
                                         "page": i, "total": job.page_count,
                                         "processed_count": job.processed_count,
                                         "status": "colorizing",
-                                        "page_progress": frac,
+                                        "progress": job.progress,
+                                        "page_progress": new,
                                         "eta_seconds": job.eta_seconds,
                                         "avg_seconds_per_page": job.avg_seconds_per_page,
                                     })
@@ -917,10 +965,11 @@ def start_colorize(job_id):
                             job.avg_seconds_per_page = (
                                 dur if prev_avg is None else 0.7 * prev_avg + 0.3 * dur
                             )
-                            job.page_progress = 1.0
                             job.processed_count += 1
-                            job.progress = job.processed_count / job.page_count
-                            job.eta_seconds = _eta_seconds(job)
+                            # The finished page is now counted in processed_count;
+                            # clear its fraction so it is not double-counted.
+                            job.page_progress = 0.0
+                            _sync_progress(job)
                             quality_record = (
                                 job.page_quality[i].model_dump()
                                 if i < len(job.page_quality) else None
@@ -930,6 +979,7 @@ def start_colorize(job_id):
                                 "total": job.page_count,
                                 "processed_count": job.processed_count,
                                 "status": "done_page",
+                                "progress": job.progress,
                                 "page_progress": 1.0,
                                 "avg_seconds_per_page": job.avg_seconds_per_page,
                                 "eta_seconds": job.eta_seconds,
@@ -958,6 +1008,9 @@ def start_colorize(job_id):
                     job.character_summary = characters.summary()
 
             job.status = "done"
+            job.progress = 1.0
+            job.page_progress = 1.0
+            job.eta_seconds = 0.0
             job.finished_at = time.time()
             q.put({"done": True})
         except _JobCancelled:
@@ -1217,6 +1270,7 @@ def job_info(job_id):
         "page_count": job.page_count,
         "source_type": job.source_type,
         "page_progress": job.page_progress,
+        "page_eta_seconds": _page_eta_seconds(job),
         "current_page": job.current_page,
         "current_page_elapsed": (
             round(time.time() - job.page_started_at, 1)

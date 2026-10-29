@@ -247,7 +247,13 @@
         }
         if (currentPage !== null && pageStartedAt !== null) {
             const elapsed = (now - pageStartedAt) / 1000;
-            setPageProgress(Math.min(95, Math.floor((elapsed / per) * 100)) / 100, currentPage);
+            const currentFrac = Math.min(95, Math.floor((elapsed / per) * 100)) / 100;
+            setPageProgress(currentFrac, currentPage);
+            // Overall bar follows work actually done: finished pages plus the
+            // fraction of the page in flight (never just the page boundary).
+            const completed = pageStates.filter(state => state === 'done').length;
+            setProgress((completed + currentFrac) / Math.max(1, pageCount),
+                        completed, pageCount);
         }
         updateEta(etaFromState());
     }
@@ -299,13 +305,19 @@
         }
     }
 
-    // Progress is driven from the monotonic processed_count, never the page index.
-    function setProgress(processed, total) {
+    // Overall progress: prefer the server's work-weighted fraction (which
+    // includes the page currently in flight); fall back to processed/total.
+    function setProgress(frac, processed, total) {
         if (!total) return;
+        if (typeof frac !== 'number' || !isFinite(frac)) {
+            frac = (processed || 0) / total;
+        }
         setIndeterminate(false);
-        const pct = Math.min(100, Math.round((processed / total) * 100));
+        const pct = Math.max(0, Math.min(100, Math.round(frac * 100)));
         colorFill.style.width = pct + '%';
-        colorCounter.textContent = `${processed} / ${total}`;
+        if (typeof processed === 'number') {
+            colorCounter.textContent = `${processed} / ${total}`;
+        }
         colorPct.textContent = pct + '%';
         colorBar.setAttribute('aria-valuenow', String(pct));
     }
@@ -352,6 +364,7 @@
         if (pollTimer) clearInterval(pollTimer);
         if (etaTimer) clearInterval(etaTimer);
         if (kind === 'done') {
+            setProgress(1, pageCount, pageCount);
             showState('processingDone');
         } else if (kind === 'cancelled') {
             showState('processingCancelled');
@@ -399,7 +412,7 @@
                     avgSecondsPerPage = data.avg_seconds_per_page;
                     hasMeasuredPage = true;
                 }
-                setProgress(data.processed_count || 0, data.total || pageCount);
+                setProgress(data.progress, data.processed_count || 0, data.total || pageCount);
                 setPageProgress(data.page_progress || 0, data.page);
                 setPageStarted(data.page);
                 updateEta(data.eta_seconds);
@@ -415,7 +428,7 @@
             case 'done_page':
                 if (typeof data.total === 'number') pageCount = data.total;
                 if (pageStates.length !== pageCount) buildPageProgress();
-                setProgress(data.processed_count, data.total || pageCount);
+                setProgress(data.progress, data.processed_count, data.total || pageCount);
                 setPageProgress(1, data.page);
                 setPageDone(data.page, data.avg_seconds_per_page);
                 updateEta(data.eta_seconds);
@@ -466,7 +479,7 @@
             setStep('Extracting pages…');
             setIndeterminate(true);
         } else {
-            setProgress(job.processed_count || 0, job.page_count || pageCount);
+            setProgress(job.progress, job.processed_count || 0, job.page_count || pageCount);
             if (typeof job.current_page === 'number' && job.page_count) {
                 // Resume the in-flight page from the server's elapsed time so a
                 // refresh does not restart the per-page estimate at zero.
